@@ -412,7 +412,7 @@ def lanzar_cluster():
     print(f"  Bootstrap Servers:  {bootstrap_servers}")
     print(f"\n  Para tu productor:")
     print(f"    export KAFKA_BOOTSTRAP=\"{bootstrap_servers}\"")
-    print(f"    python productor.py --agentes 3000 --workers 3 --velocidad 720")
+    print(f"    python productor.py --agentes 10 --workers 1 --velocidad 720")
     print("=" * 70)
 
     # ── Guardar info

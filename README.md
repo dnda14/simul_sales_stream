@@ -107,7 +107,7 @@ python levantar_ec2_kafka.py
 
 # 4. Ejecutar el productor (Terminal 1)
 export KAFKA_BOOTSTRAP="<ip1>:9092,<ip2>:9092"
-python productor.py --agentes 3000 --workers 3 --velocidad 720
+python productor.py --agentes 10 --workers 3 --velocidad 720
 
 # 5. Verificar los mensajes en vivo (Terminal 2)
 ssh -i labsuser.pem ubuntu@<ip1> '/opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic store.compra --from-beginning'
