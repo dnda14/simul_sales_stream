@@ -1,0 +1,30 @@
+# Entorno virtual
+venv/
+.env
+
+# Credenciales y llaves privadas (NUNCA subir)
+credenciales.txt
+aws_exports.sh
+ec2_info.json
+ec2_kafka_info.json
+*.pem
+*.key
+
+# Logs y temporales
+*.log
+setup_nodo*.sh
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

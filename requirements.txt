@@ -1,0 +1,4 @@
+faker==40.36.0
+numpy==2.4.6
+confluent-kafka==2.15.0
+boto3
