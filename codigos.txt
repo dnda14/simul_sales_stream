@@ -1,0 +1,11 @@
+#iniciar simulacion
+/home/ubuntu/simulador_env/bin/python /home/ubuntu/simulador_compradores.py --agentes 500 --workers 2 --velocidad 100
+
+# iniciar procesamiento de metricas conb flink
+/home/ubuntu/flink/bin/flink run \
+  -pyclientexec /home/ubuntu/simulador_env/bin/python \
+  -pyexec /home/ubuntu/simulador_env/bin/python \
+  -py /home/ubuntu/flink_procesamiento_total.py
+
+
+
