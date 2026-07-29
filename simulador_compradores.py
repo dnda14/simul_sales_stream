@@ -1,318 +1,201 @@
-"""
-simulador_compradores.py (Modificado para Clúster KRaft EC2)
-
-Simula miles de agentes-compradores con distintos perfiles, publicando eventos a
-los tópicos de Kafka configurados previamente.
-
-Instalación:
-    pip install faker numpy confluent-kafka
-
-Uso:
-    python simulador_compradores.py --agentes 3000 --workers 3 --velocidad 720
-"""
-
-import argparse
 import json
-import os
-import random
 import time
 import uuid
-from dataclasses import dataclass, field
+import random
+import argparse
 from datetime import datetime, timedelta
-from multiprocessing import Process
-
-import numpy as np
-from faker import Faker
+from multiprocessing import Process, Value
 from confluent_kafka import Producer
+from faker import Faker
 
-fake = Faker("es_ES")
+fake = Faker('es_ES')
 
-# ---------------------------------------------------------------------------
-# 1. Catálogo de productos
-# ---------------------------------------------------------------------------
-CATEGORIAS = {
-    "electronica": (100, 3000),
-    "ropa": (10, 200),
-    "hogar": (15, 500),
-    "belleza": (5, 150),
-    "deportes": (20, 800),
-    "juguetes": (10, 300),
+# ==========================================
+# 1. DEFINICIÓN DE LA MÁQUINA DE ESTADOS
+# ==========================================
+# Probabilidades de transición de un estado a otro (Cadena de Markov)
+TRANSICIONES = {
+    'OFFLINE':    {'LOGIN': 0.1, 'OFFLINE': 0.9},
+    'LOGIN':      {'EXPLORANDO': 1.0},
+    'EXPLORANDO': {'EXPLORANDO': 0.6, 'CARRITO': 0.3, 'ABANDONO': 0.1},
+    'CARRITO':    {'EXPLORANDO': 0.2, 'CHECKOUT': 0.6, 'ABANDONO': 0.2},
+    'CHECKOUT':   {'PAGO': 0.8, 'ABANDONO': 0.2},
+    'PAGO':       {'OFFLINE': 1.0},
+    'ABANDONO':   {'OFFLINE': 1.0}
 }
 
-def generar_catalogo(n=2000, seed=42):
-    rng = np.random.default_rng(seed)
-    productos = []
-    for i in range(n):
-        cat = rng.choice(list(CATEGORIAS.keys()))
-        lo, hi = CATEGORIAS[cat]
-        productos.append({
-            "product_id": f"p{i:05d}",
-            "nombre": fake.word().capitalize(),
-            "categoria": cat,
-            "marca": fake.company(),
-            "precio": round(float(rng.uniform(lo, hi)), 2),
-        })
-    return productos
-
-class Catalogo:
-    def __init__(self, productos):
-        self.productos = productos
-        self.por_categoria = {}
-        for p in productos:
-            self.por_categoria.setdefault(p["categoria"], []).append(p)
-        self.ordenado_precio = sorted(productos, key=lambda p: p["precio"])
-
-    def random(self):
-        return random.choice(self.productos)
-
-    def caro(self, percentil=0.85):
-        idx = int(len(self.ordenado_precio) * percentil)
-        return random.choice(self.ordenado_precio[idx:])
-
-# ---------------------------------------------------------------------------
-# 2. Perfiles de agentes
-# ---------------------------------------------------------------------------
-PERFILES = {
-    "compulsivo": dict(max_vistos=3, prob_compra_directa=0.55, prob_pasar_a_comparar=0.10, prob_conversion=0.75, canal_pref=["mobile", "web", "vehiculo"], usa_caros=False),
-    "comparador": dict(max_vistos=12, prob_compra_directa=0.03, prob_pasar_a_comparar=0.6, prob_conversion=0.15, canal_pref=["web"], usa_caros=False),
-    "nocturno": dict(max_vistos=6, prob_compra_directa=0.2, prob_pasar_a_comparar=0.3, prob_conversion=0.3, canal_pref=["mobile", "web"], usa_caros=False, solo_horario=(22, 6)),
-    "premium": dict(max_vistos=4, prob_compra_directa=0.3, prob_pasar_a_comparar=0.2, prob_conversion=0.5, canal_pref=["web", "pos"], usa_caros=True),
-    "frecuente": dict(max_vistos=5, prob_compra_directa=0.35, prob_pasar_a_comparar=0.25, prob_conversion=0.45, canal_pref=["mobile", "iot", "vehiculo"], usa_caros=False),
-    "explorador": dict(max_vistos=15, prob_compra_directa=0.0, prob_pasar_a_comparar=0.1, prob_conversion=0.0, canal_pref=["web", "mobile"], usa_caros=False),
-    "indeciso": dict(max_vistos=6, prob_compra_directa=0.1, prob_pasar_a_comparar=0.3, prob_conversion=0.2, canal_pref=["web", "mobile"], usa_caros=False, ciclos_carrito=(1, 4)),
-    "estacional": dict(max_vistos=5, prob_compra_directa=0.1, prob_pasar_a_comparar=0.2, prob_conversion=0.15, canal_pref=["web", "mobile", "pos"], usa_caros=False),
+ESTADOS_A_TOPICOS = {
+    'LOGIN':      ('store.login', 'login'),
+    'EXPLORANDO': ('store.ver_producto', 'ver_producto'),
+    'CARRITO':    ('store.agregar_carrito', 'agregar_carrito'),
+    'CHECKOUT':   ('store.compra', 'compra'),
+    'PAGO':       ('store.pago', 'pago'),
+    'ABANDONO':   ('store.abandono', 'abandono')
 }
 
-PESOS_PERFIL = {
-    "compulsivo": 0.12, "comparador": 0.18, "nocturno": 0.10, "premium": 0.08,
-    "frecuente": 0.15, "explorador": 0.15, "indeciso": 0.12, "estacional": 0.10,
-}
+CATALOGO = [f"p-{str(i).zfill(4)}" for i in range(1, 100)]
+CANALES = ['web', 'mobile', 'iot', 'pos']
 
-# ---------------------------------------------------------------------------
-# 3. Calendario de eventos (estacionalidad)
-# ---------------------------------------------------------------------------
-def calendario_eventos(anio=2026):
-    return {
-        "campana_escolar": (datetime(anio, 3, 1), datetime(anio, 3, 15), 1.3, 1.8),
-        "dia_del_padre":   (datetime(anio, 6, 15), datetime(anio, 6, 21), 1.4, 2.0),
-        "fiestas_patrias": (datetime(anio, 7, 25), datetime(anio, 7, 29), 1.5, 2.2),
-        "black_friday":    (datetime(anio, 11, 27), datetime(anio, 11, 30), 1.8, 3.5),
-        "cyber_monday":    (datetime(anio, 12, 1), datetime(anio, 12, 2), 1.6, 3.0),
-        "navidad":         (datetime(anio, 12, 15), datetime(anio, 12, 25), 1.7, 2.8),
-    }
-
-def evento_activo(fecha, calendario):
-    for nombre, (ini, fin, boost_compra, boost_trafico) in calendario.items():
-        if ini <= fecha <= fin:
-            return nombre, boost_compra, boost_trafico
-    return None, 1.0, 1.0
-
-# ---------------------------------------------------------------------------
-# 4. Reloj virtual
-# ---------------------------------------------------------------------------
-class RelojVirtual:
-    def __init__(self, inicio: datetime, velocidad: float):
-        self.inicio_real = time.time()
-        self.inicio_sim = inicio
-        self.velocidad = velocidad
-
-    def ahora(self) -> datetime:
-        segundos_reales = time.time() - self.inicio_real
-        return self.inicio_sim + timedelta(seconds=segundos_reales * self.velocidad)
-
-# ---------------------------------------------------------------------------
-# 5. Agente
-# ---------------------------------------------------------------------------
-@dataclass
-class Agente:
-    agent_id: str
-    perfil: str
-    canal: str
-    session_id: str = ""
-    carrito: list = field(default_factory=list)
-
-    def en_horario(self, params, fecha: datetime) -> bool:
-        if "solo_horario" not in params:
-            return True
-        ini, fin = params["solo_horario"]
-        h = fecha.hour
-        return h >= ini or h < fin
-
-    def generar_sesion(self, params, catalogo, boost_compra):
-        if self.canal == "pos": return self._sesion_pos(catalogo)
-        if self.canal in ("iot", "vehiculo"): return self._sesion_reposicion(catalogo, boost_compra)
-        return self._sesion_navegacion(params, catalogo, boost_compra)
-
-    def _sesion_navegacion(self, params, catalogo, boost_compra):
-        eventos = []
+class AgenteComprador:
+    def __init__(self, agent_id):
+        self.agent_id = agent_id
+        self.estado_actual = 'OFFLINE'
         self.session_id = str(uuid.uuid4())
-        eventos.append(("login", {}))
+        self.canal = random.choice(CANALES)
+        # 4. ENRIQUECIMIENTO GEOESPACIAL: Coordenadas fijas por sesión
+        self.lat = float(fake.latitude())
+        self.lon = float(fake.longitude())
+        self.carrito_actual = []
+        self.monto_acumulado = 0.0
 
-        vistos = 0
-        producto = None
-        max_vistos = params["max_vistos"]
-        while vistos < max_vistos:
-            accion = "busqueda" if random.random() < 0.4 else "ver_producto"
-            producto = catalogo.caro() if params["usa_caros"] else catalogo.random()
-            eventos.append((accion, {"product_id": producto["product_id"], "precio": producto["precio"]}))
-            vistos += 1
-            if random.random() < params["prob_compra_directa"] * boost_compra: break
-            if random.random() > params["prob_pasar_a_comparar"]: break
+    def avanzar_estado(self, flash_sale_activa=False):
+        # 2. INYECCIÓN DE CAOS (Data Skew)
+        # Si hay venta relámpago, los usuarios en la tienda saltan directo a comprar el producto en oferta
+        if flash_sale_activa and self.estado_actual in ['EXPLORANDO', 'CARRITO']:
+            self.estado_actual = 'CHECKOUT'
+            self.carrito_actual = ['FLASH-999'] # Producto altamente concurrido
+            self.monto_acumulado = 19.99
+            return self._generar_evento()
 
-        ciclos = params.get("ciclos_carrito")
-        if ciclos:
-            for _ in range(random.randint(*ciclos)):
-                p = catalogo.random()
-                eventos.append(("agregar_carrito", {"product_id": p["product_id"], "precio": p["precio"]}))
-                eventos.append(("eliminar_carrito", {"product_id": p["product_id"]}))
+        # Transición normal de Markov
+        opciones = list(TRANSICIONES[self.estado_actual].keys())
+        pesos = list(TRANSICIONES[self.estado_actual].values())
+        nuevo_estado = random.choices(opciones, weights=pesos, k=1)[0]
+        
+        self.estado_actual = nuevo_estado
+        
+        # Reiniciar sesión si vuelve a entrar
+        if self.estado_actual == 'LOGIN':
+            self.session_id = str(uuid.uuid4())
+            self.carrito_actual = []
+            self.monto_acumulado = 0.0
+            
+        if self.estado_actual == 'OFFLINE':
+            return None
 
-        prob_conv = min(params["prob_conversion"] * boost_compra, 0.95)
-        if producto is not None and random.random() < prob_conv:
-            eventos.append(("agregar_carrito", {"product_id": producto["product_id"], "precio": producto["precio"]}))
-            eventos.append(("compra", {"product_id": producto["product_id"], "monto": producto["precio"]}))
-            exito_pago = random.random() < 0.92
-            eventos.append(("pago", {"estado": "exitoso" if exito_pago else "fallido", "monto": producto["precio"]}))
-        else:
-            eventos.append(("abandono", {}))
+        return self._generar_evento()
 
-        return eventos
-
-    def _sesion_pos(self, catalogo):
-        self.session_id = str(uuid.uuid4())
-        p = catalogo.random()
-        exito_pago = random.random() < 0.97
-        return [
-            ("compra", {"product_id": p["product_id"], "monto": p["precio"]}),
-            ("pago", {"estado": "exitoso" if exito_pago else "fallido", "monto": p["precio"]}),
-        ]
-
-    def _sesion_reposicion(self, catalogo, boost_compra):
-        self.session_id = str(uuid.uuid4())
-        p = catalogo.random()
-        if random.random() < min(0.6 * boost_compra, 0.9):
-            exito_pago = random.random() < 0.95
-            return [
-                ("compra", {"product_id": p["product_id"], "monto": p["precio"]}),
-                ("pago", {"estado": "exitoso" if exito_pago else "fallido", "monto": p["precio"]}),
-            ]
-        return []
-
-# ---------------------------------------------------------------------------
-# 6. Publicación a Kafka
-# ---------------------------------------------------------------------------
-def crear_producer():
-    # Como el script corre en el Maestro, localhost apunta directamente al Controller/Broker
-    config = {
-        "bootstrap.servers": os.environ.get("KAFKA_BOOTSTRAP", "localhost:9092"),
-        "client.id": "simulador-python"
-    }
-    return Producer(config)
-
-def delivery_report(err, msg):
-    """Callback que se ejecuta cuando el broker de Kafka confirma la recepción."""
-    if err is not None:
-        print(f"Error al entregar mensaje: {err}")
-    else:
-        # Imprime 1 de cada 100 mensajes para verificar que las particiones se están usando
-        if random.random() < 0.01:
-            print(f"[OK] Evento '{msg.topic()}' guardado en -> Partición {msg.partition()}")
-
-def payload_telemetria(canal):
-    if canal == "iot":
-        return {"nivel_consumible": random.randint(0, 100), "bateria": random.randint(10, 100)}
-    if canal == "vehiculo":
-        return {
-            "lat": round(random.uniform(-16.5, -16.3), 4),
-            "lon": round(random.uniform(-71.6, -71.4), 4),
-            "velocidad_kmh": random.randint(0, 90),
-            "combustible_pct": random.randint(5, 100),
+    def _generar_evento(self):
+        topico, event_type = ESTADOS_A_TOPICOS[self.estado_actual]
+        
+        # 3. EVENTOS DESORDENADOS (Late Events)
+        # 5% de probabilidad de que el evento llegue con 30-90 segundos de retraso
+        ahora = datetime.utcnow()
+        if random.random() < 0.05:
+            retraso = random.randint(30, 90)
+            ahora = ahora - timedelta(seconds=retraso)
+        
+        ts_str = ahora.isoformat() + "Z"
+        
+        payload = {
+            "latitud": self.lat,
+            "longitud": self.lon
         }
-    return {}
 
-def publicar(producer, canal, agent_id, session_id, event_type, payload, fecha_sim):
-    evento = {
-        "event_id": str(uuid.uuid4()),
-        "agent_id": agent_id,
-        "session_id": session_id,
-        "channel": canal,
-        "event_type": event_type,
-        "ts": fecha_sim.isoformat(),
-        "payload": payload,
-    }
-    topic = f"store.{event_type}"
+        # Llenar payload según el estado
+        if self.estado_actual == 'EXPLORANDO':
+            producto = random.choice(CATALOGO)
+            payload["product_id"] = producto
+            self.carrito_actual = [producto] # Memoria temporal
+            
+        elif self.estado_actual == 'CARRITO':
+            if not self.carrito_actual:
+                self.carrito_actual = [random.choice(CATALOGO)]
+            payload["product_id"] = self.carrito_actual[0]
+            self.monto_acumulado = round(random.uniform(10.0, 500.0), 2)
+            
+        elif self.estado_actual == 'CHECKOUT':
+            payload["product_id"] = self.carrito_actual[0] if self.carrito_actual else "desc"
+            payload["monto"] = self.monto_acumulado
+            
+        elif self.estado_actual == 'PAGO':
+            # 10% de probabilidad de pago fallido
+            payload["estado"] = "exitoso" if random.random() > 0.1 else "fallido"
+            payload["monto"] = self.monto_acumulado
+
+        evento = {
+            "event_id": str(uuid.uuid4()),
+            "agent_id": self.agent_id,
+            "session_id": self.session_id,
+            "channel": self.canal,
+            "event_type": event_type,
+            "ts": ts_str,
+            "payload": payload
+        }
+        return topico, evento
+
+def trabajador_simulacion(worker_id, num_agentes, velocidad, bootstrap_servers, flag_flash_sale):
+    productor = Producer({'bootstrap.servers': bootstrap_servers})
     
-    # El agent_id como 'key' asegura que los eventos del mismo usuario vayan a la misma partición
-    producer.produce(topic, key=agent_id.encode('utf-8'), value=json.dumps(evento).encode('utf-8'), callback=delivery_report)
-    producer.poll(0) # Permite que el callback se ejecute asíncronamente
-
-# ---------------------------------------------------------------------------
-# 7. Loop principal de un worker
-# ---------------------------------------------------------------------------
-def worker(worker_id, n_agentes, velocidad, anio):
-    catalogo = Catalogo(generar_catalogo())
-    calendario = calendario_eventos(anio)
-    reloj = RelojVirtual(datetime(anio, 1, 1), velocidad)
-    producer = crear_producer()
-
-    perfiles = list(PESOS_PERFIL.keys())
-    pesos = list(PESOS_PERFIL.values())
-
-    agentes = []
-    for i in range(n_agentes):
-        perfil = random.choices(perfiles, weights=pesos, k=1)[0]
-        canal = random.choice(PERFILES[perfil]["canal_pref"])
-        agentes.append(Agente(agent_id=f"w{worker_id}-a{i}", perfil=perfil, canal=canal))
-
-    print(f"[worker {worker_id}] {n_agentes} agentes listos, publicando en {reloj.ahora().date()}...")
-
+    # Inicializar agentes de este worker
+    agentes = [AgenteComprador(f"w{worker_id}-a{i}") for i in range(num_agentes)]
+    
+    print(f"[Worker {worker_id}] Iniciado con {num_agentes} agentes independientes.")
+    
     try:
         while True:
-            fecha_sim = reloj.ahora()
-            _, boost_compra, boost_trafico = evento_activo(fecha_sim, calendario)
-
-            for agente in agentes:
-                params = PERFILES[agente.perfil]
-                if not agente.en_horario(params, fecha_sim):
-                    continue
-
-                if random.random() < (0.02 * boost_trafico):
-                    eventos = agente.generar_sesion(params, catalogo, boost_compra)
-                    for event_type, payload in eventos:
-                        publicar(producer, agente.canal, agente.agent_id, agente.session_id, event_type, payload, fecha_sim)
-
-                if agente.canal in ("iot", "vehiculo") and random.random() < 0.05:
-                    publicar(producer, agente.canal, agente.agent_id, agente.session_id, "telemetria", payload_telemetria(agente.canal), fecha_sim)
-
-            producer.poll(0.1) # Breve pausa para liberar CPU y procesar callbacks
-            time.sleep(0.5) # Velocidad ajustada para no saturar la máquina master
+            # Seleccionar un agente aleatorio para que actúe
+            agente = random.choice(agentes)
+            
+            # Revisar si estamos en evento de caos global
+            en_flash_sale = flag_flash_sale.value == 1
+            
+            resultado = agente.avanzar_estado(flash_sale_activa=en_flash_sale)
+            
+            if resultado:
+                topico, evento_json = resultado
+                productor.produce(
+                    topico, 
+                    key=agente.agent_id.encode('utf-8'), 
+                    value=json.dumps(evento_json).encode('utf-8')
+                )
+                productor.poll(0) # Liberar buffer asíncrono
+                
+            time.sleep(1.0 / velocidad)
+            
     except KeyboardInterrupt:
-        print(f"[worker {worker_id}] deteniendo, enviando eventos pendientes...")
-        producer.flush(10)
+        pass
+    finally:
+        productor.flush()
 
-# ---------------------------------------------------------------------------
-# 8. Entry point con multiprocessing
-# ---------------------------------------------------------------------------
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--agentes", type=int, default=3000, help="agentes totales")
-    parser.add_argument("--workers", type=int, default=3, help="procesos en paralelo")
-    parser.add_argument("--velocidad", type=float, default=720, help="factor de aceleración del reloj")
-    parser.add_argument("--anio", type=int, default=2026)
-    args = parser.parse_args()
-
-    agentes_por_worker = args.agentes // args.workers
+def orquestador(num_agentes, num_workers, velocidad, bootstrap_servers):
+    agentes_por_worker = num_agentes // num_workers
+    flag_flash_sale = Value('i', 0) # Variable compartida entre procesos
     procesos = []
-    for w in range(args.workers):
-        p = Process(target=worker, args=(w, agentes_por_worker, args.velocidad, args.anio))
+
+    for i in range(num_workers):
+        p = Process(target=trabajador_simulacion, args=(i, agentes_por_worker, velocidad, bootstrap_servers, flag_flash_sale))
         p.start()
         procesos.append(p)
 
+    print("\n🚀 SIMULADOR AVANZADO INICIADO 🚀")
+    print("--------------------------------------------------")
+    print(f"Agentes Totales: {num_agentes} | Workers: {num_workers} | Tasa base: {velocidad} evt/s")
+    print("Mecánicas activas: Máquina de Estados, Data Skew, Late Events, Geoespacial")
+    print("Presiona Ctrl+C para detener.\n")
+
     try:
-        for p in procesos:
-            p.join()
+        while True:
+            # Bucle del orquestador: Decide aleatoriamente si lanza un evento de caos
+            time.sleep(random.randint(15, 45))
+            if random.random() < 0.3: # 30% de probabilidad cada ciclo
+                print("\n⚡ [CAOS INYECTADO] ¡FLASH SALE INICIADA! Todos los agentes comprando FLASH-999 ⚡")
+                flag_flash_sale.value = 1
+                time.sleep(5) # La oferta dura 5 segundos
+                flag_flash_sale.value = 0
+                print("⏳ [CAOS TERMINADO] Flash sale finalizada. Retornando a Markov.\n")
     except KeyboardInterrupt:
+        print("\nDeteniendo simulación...")
         for p in procesos:
             p.terminate()
+            p.join()
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Simulador de E-Commerce Avanzado (Markov & Caos)")
+    parser.add_argument('--agentes', type=int, default=1000, help='Total de compradores virtuales')
+    parser.add_argument('--workers', type=int, default=2, help='Hilos de procesamiento paralelos')
+    parser.add_argument('--velocidad', type=int, default=50, help='Eventos por segundo por worker')
+    parser.add_argument('--servers', type=str, default='localhost:9092', help='Kafka Bootstrap Servers')
+    
+    args = parser.parse_args()
+    orquestador(args.agentes, args.workers, args.velocidad, args.servers)

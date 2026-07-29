@@ -11,6 +11,9 @@ TOPICOS_METRICAS = [
     {"nombre": "dashboard.negocio", "particiones": 3, "replicacion": 2},
     {"nombre": "dashboard.audiencias", "particiones": 4, "replicacion": 2},
     {"nombre": "dashboard.alertas", "particiones": 2, "replicacion": 2},
+    # Nuevos tópicos para análisis avanzado
+    {"nombre": "dashboard.conversiones", "particiones": 3, "replicacion": 2},
+    {"nombre": "dashboard.geo", "particiones": 3, "replicacion": 2},
 ]
 
 def crear_topicos_metricas():

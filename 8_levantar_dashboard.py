@@ -32,17 +32,18 @@ def desplegar_dashboard():
     try:
         ssh.connect(maestro_ip, username="ubuntu", key_filename=KEY_FILE)
 
-        # 2. Subir el archivo del dashboard
+        # 2. Subir el archivo del dashboard actualizado
         print(f"[Hito] Subiendo '{DASHBOARD_SCRIPT}' al Maestro...")
         sftp = ssh.open_sftp()
         sftp.put(DASHBOARD_SCRIPT, f"/home/ubuntu/{DASHBOARD_SCRIPT}")
         sftp.close()
         print("  \u2713 Dashboard subido exitosamente.")
 
-        # 3. Instalar Streamlit y Pandas en el entorno virtual
-        print("[Hito] Instalando Streamlit y Pandas en el entorno virtual (esto tomará unos segundos)...")
+        # 3. Instalar dependencias completas (incluyendo Altair)
+        print("[Hito] Instalando Streamlit, Pandas y Altair en el entorno virtual...")
+        # CORRECCIÓN AQUÍ: Se añadió 'altair' a la lista de pip install
         cmd_dependencias = (
-            "/home/ubuntu/simulador_env/bin/python -m pip install -q streamlit pandas"
+            "/home/ubuntu/simulador_env/bin/python -m pip install -q streamlit pandas altair"
         )
         stdin, stdout, stderr = ssh.exec_command(cmd_dependencias)
         exit_status = stdout.channel.recv_exit_status()

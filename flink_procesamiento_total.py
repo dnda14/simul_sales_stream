@@ -3,7 +3,7 @@ from pyflink.datastream import StreamExecutionEnvironment
 from pyflink.table import StreamTableEnvironment, EnvironmentSettings
 
 def ejecutar_procesamiento_total():
-    print("Iniciando Motor Unificado de PyFlink...")
+    print("Iniciando Motor Unificado de PyFlink (Corrección de Watermarks e Idle Partitions)...")
     
     # 1. CONFIGURACIÓN DEL ENTORNO
     env = StreamExecutionEnvironment.get_execution_environment()
@@ -13,150 +13,164 @@ def ejecutar_procesamiento_total():
     settings = EnvironmentSettings.new_instance().in_streaming_mode().build()
     t_env = StreamTableEnvironment.create(env, environment_settings=settings)
     
-    # 2. DEFINICIÓN DE ORÍGENES (SOURCES) - Leyendo los JSON de Kafka
+    # =====================================================================
+    # 2. DEFINICIÓN DE ORÍGENES (Corregido mapeo de 'ts' e Idle Timeout)
     # =====================================================================
     
     t_env.execute_sql("""
         CREATE TABLE origen_vistas (
-            event_id STRING, agent_id STRING, event_type STRING, proctime AS PROCTIME()
+            event_id STRING, 
+            agent_id STRING, 
+            event_type STRING, 
+            ts STRING, -- Lee el campo exacto del JSON
+            payload ROW<product_id STRING, latitud DOUBLE, longitud DOUBLE>,
+            evento_ts AS TO_TIMESTAMP(SUBSTRING(REPLACE(ts, 'T', ' '), 1, 23)),
+            WATERMARK FOR evento_ts AS evento_ts - INTERVAL '5' SECONDS
         ) WITH (
-            'connector' = 'kafka', 'topic' = 'store.ver_producto', 'properties.bootstrap.servers' = 'localhost:9092', 'properties.group.id' = 'flink-master-group', 'format' = 'json', 'scan.startup.mode' = 'latest-offset'
+            'connector' = 'kafka', 'topic' = 'store.ver_producto', 'properties.bootstrap.servers' = 'localhost:9092', 
+            'properties.group.id' = 'flink-master-group', 'format' = 'json', 'scan.startup.mode' = 'latest-offset',
+            'scan.watermark.idle-timeout' = '2000' -- Evita congelamientos por particiones vacías
         )
     """)
 
     t_env.execute_sql("""
         CREATE TABLE origen_compras (
-            event_id STRING, agent_id STRING, payload ROW<product_id STRING, monto DOUBLE>, proctime AS PROCTIME()
+            event_id STRING, 
+            agent_id STRING, 
+            ts STRING,
+            payload ROW<product_id STRING, monto DOUBLE, latitud DOUBLE, longitud DOUBLE>,
+            evento_ts AS TO_TIMESTAMP(SUBSTRING(REPLACE(ts, 'T', ' '), 1, 23)),
+            WATERMARK FOR evento_ts AS evento_ts - INTERVAL '5' SECONDS
         ) WITH (
-            'connector' = 'kafka', 'topic' = 'store.compra', 'properties.bootstrap.servers' = 'localhost:9092', 'properties.group.id' = 'flink-master-group', 'format' = 'json', 'scan.startup.mode' = 'latest-offset'
+            'connector' = 'kafka', 'topic' = 'store.compra', 'properties.bootstrap.servers' = 'localhost:9092', 
+            'properties.group.id' = 'flink-master-group', 'format' = 'json', 'scan.startup.mode' = 'latest-offset',
+            'scan.watermark.idle-timeout' = '2000'
         )
     """)
 
     t_env.execute_sql("""
         CREATE TABLE origen_pagos (
-            event_id STRING, payload ROW<estado STRING, monto DOUBLE>, proctime AS PROCTIME()
+            event_id STRING, 
+            ts STRING,
+            payload ROW<estado STRING, monto DOUBLE>,
+            evento_ts AS TO_TIMESTAMP(SUBSTRING(REPLACE(ts, 'T', ' '), 1, 23)),
+            WATERMARK FOR evento_ts AS evento_ts - INTERVAL '5' SECONDS
         ) WITH (
-            'connector' = 'kafka', 'topic' = 'store.pago', 'properties.bootstrap.servers' = 'localhost:9092', 'properties.group.id' = 'flink-master-group', 'format' = 'json', 'scan.startup.mode' = 'latest-offset'
+            'connector' = 'kafka', 'topic' = 'store.pago', 'properties.bootstrap.servers' = 'localhost:9092', 
+            'properties.group.id' = 'flink-master-group', 'format' = 'json', 'scan.startup.mode' = 'latest-offset',
+            'scan.watermark.idle-timeout' = '2000'
         )
     """)
     
     t_env.execute_sql("""
         CREATE TABLE origen_abandono (
-            event_id STRING, agent_id STRING, proctime AS PROCTIME()
+            event_id STRING, 
+            agent_id STRING, 
+            ts STRING,
+            evento_ts AS TO_TIMESTAMP(SUBSTRING(REPLACE(ts, 'T', ' '), 1, 23)),
+            WATERMARK FOR evento_ts AS evento_ts - INTERVAL '5' SECONDS
         ) WITH (
-            'connector' = 'kafka', 'topic' = 'store.abandono', 'properties.bootstrap.servers' = 'localhost:9092', 'properties.group.id' = 'flink-master-group', 'format' = 'json', 'scan.startup.mode' = 'latest-offset'
+            'connector' = 'kafka', 'topic' = 'store.abandono', 'properties.bootstrap.servers' = 'localhost:9092', 
+            'properties.group.id' = 'flink-master-group', 'format' = 'json', 'scan.startup.mode' = 'latest-offset',
+            'scan.watermark.idle-timeout' = '2000'
         )
     """)
 
-    # 3. DEFINICIÓN DE DESTINOS (SINKS) - Escribiendo JSON procesados para Streamlit
+    # =====================================================================
+    # 3. DEFINICIÓN DE DESTINOS 
     # =====================================================================
     
-    t_env.execute_sql("""
-        CREATE TABLE destino_trafico (
-            ventana_tiempo TIMESTAMP(3), metrica STRING, valor BIGINT
-        ) WITH ( 'connector' = 'kafka', 'topic' = 'dashboard.trafico', 'properties.bootstrap.servers' = 'localhost:9092', 'format' = 'json' )
-    """)
+    t_env.execute_sql("CREATE TABLE destino_trafico ( ventana_tiempo TIMESTAMP(3), metrica STRING, valor BIGINT ) WITH ( 'connector' = 'kafka', 'topic' = 'dashboard.trafico', 'properties.bootstrap.servers' = 'localhost:9092', 'format' = 'json' )")
+    t_env.execute_sql("CREATE TABLE destino_negocio ( ventana_tiempo TIMESTAMP(3), total_ventas DOUBLE, tickets BIGINT ) WITH ( 'connector' = 'kafka', 'topic' = 'dashboard.negocio', 'properties.bootstrap.servers' = 'localhost:9092', 'format' = 'json' )")
+    t_env.execute_sql("CREATE TABLE destino_audiencias ( ventana_tiempo TIMESTAMP(3), agent_id STRING, audiencia STRING, justificacion STRING ) WITH ( 'connector' = 'kafka', 'topic' = 'dashboard.audiencias', 'properties.bootstrap.servers' = 'localhost:9092', 'format' = 'json' )")
+    t_env.execute_sql("CREATE TABLE destino_alertas ( ventana_tiempo TIMESTAMP(3), nivel STRING, mensaje STRING ) WITH ( 'connector' = 'kafka', 'topic' = 'dashboard.alertas', 'properties.bootstrap.servers' = 'localhost:9092', 'format' = 'json' )")
+    t_env.execute_sql("CREATE TABLE destino_conversiones ( agent_id STRING, product_id STRING, tiempo_decision_segundos BIGINT ) WITH ( 'connector' = 'kafka', 'topic' = 'dashboard.conversiones', 'properties.bootstrap.servers' = 'localhost:9092', 'format' = 'json' )")
+    t_env.execute_sql("CREATE TABLE destino_geo ( ventana_tiempo TIMESTAMP(3), latitud DOUBLE, longitud DOUBLE, total_ventas DOUBLE ) WITH ( 'connector' = 'kafka', 'topic' = 'dashboard.geo', 'properties.bootstrap.servers' = 'localhost:9092', 'format' = 'json' )")
 
-    t_env.execute_sql("""
-        CREATE TABLE destino_negocio (
-            ventana_tiempo TIMESTAMP(3), total_ventas DOUBLE, tickets BIGINT
-        ) WITH ( 'connector' = 'kafka', 'topic' = 'dashboard.negocio', 'properties.bootstrap.servers' = 'localhost:9092', 'format' = 'json' )
-    """)
-
-    t_env.execute_sql("""
-        CREATE TABLE destino_audiencias (
-            ventana_tiempo TIMESTAMP(3), agent_id STRING, audiencia STRING, justificacion STRING
-        ) WITH ( 'connector' = 'kafka', 'topic' = 'dashboard.audiencias', 'properties.bootstrap.servers' = 'localhost:9092', 'format' = 'json' )
-    """)
-
-    t_env.execute_sql("""
-        CREATE TABLE destino_alertas (
-            ventana_tiempo TIMESTAMP(3), nivel STRING, mensaje STRING
-        ) WITH ( 'connector' = 'kafka', 'topic' = 'dashboard.alertas', 'properties.bootstrap.servers' = 'localhost:9092', 'format' = 'json' )
-    """)
-
-    # 4. REGLAS DE NEGOCIO Y PROCESAMIENTO (STATEMENT SET)
     # =====================================================================
-    # Envolvemos todas las consultas en un solo StatementSet para usar un solo Job
-    
+    # 4. REGLAS DE NEGOCIO (Usando el nuevo campo `evento_ts`)
+    # =====================================================================
     statement_set = t_env.create_statement_set()
 
-    # Regla 1 (Tráfico): Medir eventos por segundo (Throughput) de visualizaciones
+    # Regla 1 (Tráfico)
     statement_set.add_insert_sql("""
         INSERT INTO destino_trafico
         SELECT 
-            TUMBLE_START(proctime, INTERVAL '5' SECONDS) AS ventana_tiempo,
+            TUMBLE_START(evento_ts, INTERVAL '5' SECONDS) AS ventana_tiempo,
             'vistas_por_5_segundos' AS metrica,
             COUNT(event_id) AS valor
         FROM origen_vistas
-        GROUP BY TUMBLE(proctime, INTERVAL '5' SECONDS)
+        GROUP BY TUMBLE(evento_ts, INTERVAL '5' SECONDS)
     """)
 
-    # Regla 2 (Negocio): Agregación financiera (Revenue y Tickets por minuto)
+    # Regla 2 (Negocio)
     statement_set.add_insert_sql("""
         INSERT INTO destino_negocio
         SELECT 
-            TUMBLE_START(proctime, INTERVAL '60' SECONDS) AS ventana_tiempo,
+            TUMBLE_START(evento_ts, INTERVAL '15' SECONDS) AS ventana_tiempo, -- Reducido a 15s para visualización rápida
             SUM(payload.monto) AS total_ventas,
             COUNT(event_id) AS tickets
         FROM origen_compras
-        GROUP BY TUMBLE(proctime, INTERVAL '60' SECONDS)
+        GROUP BY TUMBLE(evento_ts, INTERVAL '15' SECONDS)
     """)
 
-    # Regla 3 (Audiencias): Detectar "Usuario Explorador" (Alta navegación sin compra inmediata)
+    # Regla 3 (Audiencias)
     statement_set.add_insert_sql("""
         INSERT INTO destino_audiencias
         SELECT 
-            TUMBLE_START(proctime, INTERVAL '30' SECONDS) AS ventana_tiempo,
+            TUMBLE_START(evento_ts, INTERVAL '30' SECONDS) AS ventana_tiempo,
             agent_id,
             'Usuario Explorador' AS audiencia,
             CAST(COUNT(event_id) AS STRING) || ' vistas en 30s' AS justificacion
         FROM origen_vistas
-        GROUP BY agent_id, TUMBLE(proctime, INTERVAL '30' SECONDS)
+        GROUP BY agent_id, TUMBLE(evento_ts, INTERVAL '30' SECONDS)
         HAVING COUNT(event_id) >= 8
     """)
 
-    # Regla 4 (Audiencias): Detectar "Cliente Premium" (Ticket muy alto)
-    # (Al ser una alerta instantánea, no requiere ventana de tiempo, pero se la ponemos de 1 segundo para emparejar formatos)
-    statement_set.add_insert_sql("""
-        INSERT INTO destino_audiencias
-        SELECT 
-            TUMBLE_START(proctime, INTERVAL '1' SECOND) AS ventana_tiempo,
-            agent_id,
-            'Cliente Premium' AS audiencia,
-            'Compra de ' || CAST(payload.monto AS STRING) AS justificacion
-        FROM origen_compras
-        WHERE payload.monto > 2000.0
-        GROUP BY agent_id, payload.monto, TUMBLE(proctime, INTERVAL '1' SECOND)
-    """)
-
-    # Regla 5 (Alertas): Detección de Anomalías - Picos de pagos rechazados
+    # Regla 4 (Alertas)
     statement_set.add_insert_sql("""
         INSERT INTO destino_alertas
         SELECT 
-            TUMBLE_START(proctime, INTERVAL '10' SECONDS) AS ventana_tiempo,
+            TUMBLE_START(evento_ts, INTERVAL '10' SECONDS) AS ventana_tiempo,
             'CRÍTICO' AS nivel,
             'Anomalía: ' || CAST(COUNT(event_id) AS STRING) || ' pagos rechazados detectados' AS mensaje
         FROM origen_pagos
         WHERE payload.estado = 'fallido'
-        GROUP BY TUMBLE(proctime, INTERVAL '10' SECONDS)
+        GROUP BY TUMBLE(evento_ts, INTERVAL '10' SECONDS)
         HAVING COUNT(event_id) >= 4
     """)
     
-    # Regla 6 (Alertas): Picos de Carritos Abandonados
+    # Regla 5 (Geoespacial)
     statement_set.add_insert_sql("""
-        INSERT INTO destino_alertas
+        INSERT INTO destino_geo
         SELECT 
-            TUMBLE_START(proctime, INTERVAL '10' SECONDS) AS ventana_tiempo,
-            'ADVERTENCIA' AS nivel,
-            'Alta tasa de abandono: ' || CAST(COUNT(event_id) AS STRING) || ' abandonos' AS mensaje
-        FROM origen_abandono
-        GROUP BY TUMBLE(proctime, INTERVAL '10' SECONDS)
-        HAVING COUNT(event_id) >= 15
+            TUMBLE_START(evento_ts, INTERVAL '15' SECONDS) AS ventana_tiempo, -- Reducido a 15s para pintar el mapa rápido
+            ROUND(payload.latitud, 2) AS latitud, 
+            ROUND(payload.longitud, 2) AS longitud,
+            SUM(payload.monto) AS total_ventas
+        FROM origen_compras
+        GROUP BY 
+            ROUND(payload.latitud, 2), 
+            ROUND(payload.longitud, 2), 
+            TUMBLE(evento_ts, INTERVAL '15' SECONDS)
     """)
 
-    # 5. EJECUTAR EL GRAFO DE PROCESAMIENTO
-    print("Enviando el Job distribuido a los Trabajadores de Flink...")
+    # Regla 6 (Interval Join)
+    statement_set.add_insert_sql("""
+        INSERT INTO destino_conversiones
+        SELECT 
+            v.agent_id,
+            v.payload.product_id,
+            TIMESTAMPDIFF(SECOND, v.evento_ts, c.evento_ts) AS tiempo_decision_segundos
+        FROM origen_vistas v
+        JOIN origen_compras c 
+          ON v.agent_id = c.agent_id 
+          AND v.payload.product_id = c.payload.product_id
+        WHERE c.evento_ts BETWEEN v.evento_ts AND v.evento_ts + INTERVAL '5' MINUTE
+    """)
+
+    # 5. EJECUTAR EL GRAFO
+    print("Enviando Job (Event Time corregido)...")
     statement_set.execute()
 
 if __name__ == '__main__':
