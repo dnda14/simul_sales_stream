@@ -8,7 +8,7 @@ Sistema de simulación de flujos de compra en tiempo real, procesamiento analít
 
 | Componente | Versión | Notas |
 |------------|----------|-------|
-| Apache Kafka | **4.3.1** (Scala 2.13) | Modo **KRaft** (sin ZooKeeper) |
+| Apache Kafka | **4.3.1** (Scala 2.13) | Modo **KRaft** |
 | Apache Flink | **1.18.1** | Motor de procesamiento distribuido (Table API) |
 | Python | **3.10 / 3.11** | Entorno virtual estricto para evitar colisión de versiones |
 | confluent-kafka | **2.15.0** | Cliente Kafka para Python |
