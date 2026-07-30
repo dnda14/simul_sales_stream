@@ -35,6 +35,7 @@ Motor analítico que lee los tópicos crudos, agrupa la información mediante ve
 
 Consumidor web que lee los tópicos de métricas ya procesados y renderiza gráficos interactivos actualizados en milisegundos.
 
+![Arquitectura](pipeline.png)
 ---
 
 # Tópicos Crudos (Entrada)
