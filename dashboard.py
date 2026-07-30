@@ -145,7 +145,7 @@ try:
                 chart = renderizar_grafico_area(historial_ventas, "Hora", "Ingresos", "#2ca02c", "Ingresos ($)")
                 ph_chart_ventas.altair_chart(chart, use_container_width=True)
                 
-            # --- CANALES Y EVENTOS (NUEVO) ---
+            # --- CANALES Y EVENTOS ---
             elif topic == 'dashboard.canales':
                 estado_canales[record.get('canal', 'N/A')] = record.get('total_eventos', 0)
                 chart_canales = renderizar_dona(estado_canales, "Distribución por Canal")
