@@ -110,7 +110,7 @@ def renderizar_barras_horizontales(diccionario, titulo):
     return chart
 
 # 6. Bucle principal de consumo
-st.caption("🟢 Escuchando eventos del clúster...")
+st.caption("Escuchando eventos del clúster...")
 
 try:
     while True:
